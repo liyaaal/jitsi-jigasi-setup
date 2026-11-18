@@ -1,143 +1,150 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
+umask 077
 
-echo "=============================================="
-echo " Jitsi Meet + Jicofo + Whisper ASR Installer"
-echo "=============================================="
+VERSION=stable-11248-3
+UPSTREAM_COMMIT=fca3e3a578a1bdd527c20b9d86a31cfc362d5426
+INSTALL_DIR="${HOME}/meeting-pro-server"
+PUBLIC_URL=''
+ADVERTISE_IP=''
+EMAIL=''
+VOSK_IMAGE='alphacep/kaldi-ru:latest'
+ACTION="${1:-help}"
+[[ $# -eq 0 ]] || shift
+die() { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
+usage() {
+    cat <<'HELP'
+Jitsi + Jigasi + Vosk (русский), Linux / Docker Compose v2
 
-echo "[1/9] System info:"
-lsb_release -d 2>/dev/null || cat /etc/os-release | head -3
-echo "RAM: $(free -h | awk '/Mem:/{print $2}')"
-echo "Disk: $(df -h / | awk 'NR==2{print $4 " free"}')"
-LOCAL_IP=$(hostname -I | awk '{print $1}')
-echo "IP: $LOCAL_IP"
+  bash jitsi_install.sh configure --public-url https://meet.example.org \
+    --advertise-ip 203.0.113.10 --email admin@example.org [--dir /path/to/new/install]
+  bash jitsi_install.sh up     [--dir /path/to/install]
+  bash jitsi_install.sh status [--dir /path/to/install]
+  bash jitsi_install.sh logs   [--dir /path/to/install]
+  bash jitsi_install.sh stop   [--dir /path/to/install]
 
-echo "[2/9] Checking Docker..."
-if ! command -v docker &>/dev/null; then
-  echo "Installing Docker..."
-  sudo apt-get update -y -q
-  sudo apt-get install -y -q ca-certificates curl gnupg
-  sudo install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  sudo chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  sudo apt-get update -y -q
-  sudo apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-  sudo usermod -aG docker "$USER"
-  echo "Docker installed."
-else
-  echo "Docker already installed: $(docker --version)"
-fi
-
-echo "[3/9] Starting Docker daemon..."
-if ! docker info &>/dev/null 2>&1; then
-  sudo service docker start 2>/dev/null || true
-  sleep 3
-  if ! docker info &>/dev/null 2>&1; then
-    sudo dockerd > /tmp/dockerd.log 2>&1 &
-    sleep 5
-  fi
-fi
-
-echo "[4/9] Setting up docker-jitsi-meet..."
-JITSI_DIR="/home/dt/docker-jitsi-meet"
-if [ ! -d "$JITSI_DIR" ]; then
-  git clone https://github.com/jitsi/docker-jitsi-meet.git "$JITSI_DIR"
-else
-  git -C "$JITSI_DIR" pull --ff-only || true
-fi
-cd "$JITSI_DIR"
-[ ! -f ".env" ] && cp env.example .env
-
-echo "[5/9] Configuring .env..."
-for p in JICOFO_AUTH_PASSWORD JVB_AUTH_PASSWORD JIGASI_XMPP_PASSWORD JIBRI_RECORDER_PASSWORD JIBRI_XMPP_PASSWORD; do
-  sed -i "s/^$p=.*/$p=$(openssl rand -hex 16)/" .env
+configure создаёт конфигурацию; up запускает контейнеры.
+Нужны DNS на сервер, доступные 80/tcp, 443/tcp, 10000/udp, Docker Compose v2.
+Docker, firewall и существующие установки скрипт не изменяет.
+Для другого языка: --vosk-image alphacep/kaldi-en:latest (или образ@sha256:...).
+HELP
+}
+while [[ $# -gt 0 ]]; do
+    [[ $# -ge 2 ]] || die "Нет значения для $1"
+    case "$1" in
+        --dir) INSTALL_DIR="$2" ;;
+        --public-url) PUBLIC_URL="${2%/}" ;;
+        --advertise-ip) ADVERTISE_IP="$2" ;;
+        --email) EMAIL="$2" ;;
+        --vosk-image) VOSK_IMAGE="$2" ;;
+        *) die "Неизвестный параметр: $1" ;;
+    esac
+    shift 2
 done
+case "$ACTION" in help|--help|-h) usage; exit 0 ;; configure|up|status|logs|stop) ;; *) die "Неизвестная команда: $ACTION" ;; esac
+[[ "$INSTALL_DIR" =~ ^/[a-zA-Z0-9_./-]+$ && "$INSTALL_DIR" != / ]] || die 'Каталог должен быть абсолютным путём без пробелов.'
+command -v docker >/dev/null || die 'Установите Docker Engine: https://docs.docker.com/engine/install/'
+docker compose version >/dev/null || die 'Установите Docker Compose v2.'
 
-if grep -q "^#PUBLIC_URL=" .env || grep -q "^PUBLIC_URL=" .env; then
-  sed -i "s|^#*PUBLIC_URL=.*|PUBLIC_URL=http://$LOCAL_IP:8080|" .env
-else
-  echo "PUBLIC_URL=http://$LOCAL_IP:8080" >> .env
-fi
+set_env() {
+    local key="$1" value="$2" temp
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die 'Недопустимый перенос строки в настройке.'
+    temp=$(mktemp "${INSTALL_DIR}/.env.XXXXXX")
+    awk -v key="$key" '$0 !~ "^[#[:space:]]*" key "=" { print }' "$INSTALL_DIR/.env" > "$temp"
+    printf '%s=%s\n' "$key" "$value" >> "$temp"
+    mv -- "$temp" "$INSTALL_DIR/.env"
+}
+get_env() { sed -n "s/^$1=//p" "$INSTALL_DIR/.env" | head -n 1; }
+compose() {
+    local project
+    project="meeting-pro-$(printf '%s' "$INSTALL_DIR" | cksum | awk '{print $1}')"
+    docker compose --project-name "$project" --env-file "$INSTALL_DIR/.env" -f "$INSTALL_DIR/docker-compose.yml" -f "$INSTALL_DIR/transcriber.yml" -f "$INSTALL_DIR/meeting-pro.yml" "$@"
+}
 
-if grep -q "^#*DOCKER_HOST_ADDRESS=" .env; then
-  sed -i "s|^#*DOCKER_HOST_ADDRESS=.*|DOCKER_HOST_ADDRESS=$LOCAL_IP|" .env
-else
-  echo "DOCKER_HOST_ADDRESS=$LOCAL_IP" >> .env
-fi
-
-grep -q "^ENABLE_TRANSCRIPTIONS" .env || echo "ENABLE_TRANSCRIPTIONS=1" >> .env
-grep -q "^JIGASI_TRANSCRIBER_RECORD_AUDIO" .env || echo "JIGASI_TRANSCRIBER_RECORD_AUDIO=true" >> .env
-grep -q "^JIGASI_TRANSCRIBER_SEND_TXT" .env || echo "JIGASI_TRANSCRIBER_SEND_TXT=true" >> .env
-
-echo "[6/9] Creating config directories..."
-CONFIG_DIR="/home/dt/.jitsi-meet-cfg"
-mkdir -p "$CONFIG_DIR"/{web,transcripts,prosody/config,prosody/prosody-plugins-custom,jicofo,jvb,jigasi,jibri}
-grep -q "^CONFIG=" .env || echo "CONFIG=$CONFIG_DIR" >> .env
-
-echo "[7/9] Creating transcriber.yml..."
-cat > "$JITSI_DIR/transcriber.yml" << EOFYML
-version: '3.8'
+if [[ "$ACTION" == configure ]]; then
+    [[ "$PUBLIC_URL" =~ ^https://([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] || die 'Укажите HTTPS-домен без пути и порта.'
+    [[ "$ADVERTISE_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || die 'Укажите доступный участникам IPv4 сервера.'
+    IFS=. read -r -a octets <<< "$ADVERTISE_IP"
+    for octet in "${octets[@]}"; do ((10#$octet <= 255)) || die 'Некорректный IPv4.'; done
+    [[ "$EMAIL" =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] || die 'Укажите email для сертификата TLS.'
+    [[ "$VOSK_IMAGE" =~ ^[a-zA-Z0-9][a-zA-Z0-9./:@_-]*$ ]] || die 'Некорректное имя ASR-образа.'
+    for tool in git openssl awk sed; do command -v "$tool" >/dev/null || die "Не найдена утилита $tool"; done
+    if [[ -e "$INSTALL_DIR" ]]; then
+        [[ -f "$INSTALL_DIR/.meeting-pro-managed" ]] || die 'Каталог уже существует и не управляется этим скриптом. Выберите новый --dir.'
+        [[ "$(cat "$INSTALL_DIR/.meeting-pro-managed")" == "$VERSION" ]] || die 'Версия существующей установки отличается. Используйте отдельный каталог.'
+        [[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" == "$UPSTREAM_COMMIT" ]] || die 'Изменена версия upstream. Используйте отдельный каталог.'
+    else
+        git clone --depth 1 --branch "$VERSION" https://github.com/jitsi/docker-jitsi-meet.git "$INSTALL_DIR"
+        [[ "$(git -C "$INSTALL_DIR" rev-parse HEAD)" == "$UPSTREAM_COMMIT" ]] || die 'Контрольная версия upstream не совпала.'
+        printf '%s\n' "$VERSION" > "$INSTALL_DIR/.meeting-pro-managed"
+    fi
+    if [[ -f "$INSTALL_DIR/.env" ]]; then
+        cp -p -- "$INSTALL_DIR/.env" "$INSTALL_DIR/.env.backup.$(date +%Y%m%d%H%M%S).$$"
+    else
+        cp -- "$INSTALL_DIR/env.example" "$INSTALL_DIR/.env"
+    fi
+    for key in JICOFO_AUTH_PASSWORD JVB_AUTH_PASSWORD JIGASI_XMPP_PASSWORD JIGASI_TRANSCRIBER_PASSWORD JIBRI_RECORDER_PASSWORD JIBRI_XMPP_PASSWORD; do
+        value=$(get_env "$key")
+        if [[ -z "$value" || "$value" == passw0rd ]]; then set_env "$key" "$(openssl rand -hex 32)"; fi
+    done
+    set_env CONFIG "$INSTALL_DIR/config"
+    set_env JITSI_IMAGE_VERSION "$VERSION"
+    set_env PUBLIC_URL "$PUBLIC_URL"
+    set_env JVB_ADVERTISE_IPS "$ADVERTISE_IP"
+    set_env HTTP_PORT 80
+    set_env HTTPS_PORT 443
+    set_env ENABLE_HTTP_REDIRECT 1
+    set_env ENABLE_LETSENCRYPT 1
+    set_env LETSENCRYPT_DOMAIN "${PUBLIC_URL#https://}"
+    set_env LETSENCRYPT_EMAIL "$EMAIL"
+    set_env LETSENCRYPT_ACME_SERVER letsencrypt
+    set_env ENABLE_JAAS_COMPONENTS 0
+    set_env ENABLE_TRANSCRIPTIONS 1
+    set_env JIGASI_TRANSCRIBER_CUSTOM_SERVICE org.jitsi.jigasi.transcription.VoskTranscriptionService
+    set_env JIGASI_TRANSCRIBER_VOSK_URL ws://vosk:2700
+    set_env JIGASI_TRANSCRIBER_ENABLE_SAVING true
+    set_env JIGASI_TRANSCRIBER_RECORD_AUDIO false
+    set_env JIGASI_TRANSCRIBER_SEND_TXT true
+    set_env JIGASI_TRANSCRIBER_ADVERTISE_URL false
+    set_env VOSK_IMAGE "$VOSK_IMAGE"
+    mkdir -p "$INSTALL_DIR/config"/{web,prosody/config,prosody/prosody-plugins-custom,jicofo,jvb,jigasi,jibri,transcriber}
+    mkdir -p "$INSTALL_DIR/config"/storage/{jibri,prosody,transcripts,web} "$INSTALL_DIR/config"/tmp/{web-crontabs,web-load-test}
+    mkdir -p "$INSTALL_DIR/config/web/nginx-custom"
+    printf 'location ^~ /transcripts/ { return 403; }\n' > "$INSTALL_DIR/config/web/nginx-custom/meeting-pro-private-transcripts.conf"
+    chmod 644 "$INSTALL_DIR/config/web/nginx-custom/meeting-pro-private-transcripts.conf"
+    # Official rootless images use uid 1000. Only their writable storage is shared;
+    # the parent installation directory remains private (umask 077).
+    chmod 755 "$INSTALL_DIR/config" "$INSTALL_DIR/config/storage" "$INSTALL_DIR/config/tmp"
+    chmod 755 "$INSTALL_DIR/config"/{web,web/nginx-custom,prosody,prosody/config,prosody/prosody-plugins-custom,jicofo,jvb,jigasi,jibri,transcriber}
+    chmod 777 "$INSTALL_DIR/config"/storage/{jibri,prosody,transcripts,web} "$INSTALL_DIR/config"/tmp/{web-crontabs,web-load-test}
+    cat > "$INSTALL_DIR/meeting-pro.yml" <<'YAML'
 services:
-  jigasi:
-    image: jitsi/jigasi:latest
-    restart: unless-stopped
-    volumes:
-      - \${CONFIG:-~/.jitsi-meet-cfg}/jigasi:/config:Z
-      - \${CONFIG:-~/.jitsi-meet-cfg}/transcripts:/tmp/transcripts:Z
-    environment:
-      - XMPP_SERVER=prosody
-      - XMPP_DOMAIN=\${XMPP_DOMAIN:-meet.jitsi}
-      - XMPP_AUTH_DOMAIN=auth.\${XMPP_DOMAIN:-meet.jitsi}
-      - XMPP_MUC_DOMAIN=muc.\${XMPP_DOMAIN:-meet.jitsi}
-      - JIGASI_XMPP_USER=jigasi
-      - JIGASI_XMPP_PASSWORD=\${JIGASI_XMPP_PASSWORD}
-      - JIGASI_MODE=transcriber
-      - ENABLE_TRANSCRIPTIONS=1
-      - JIGASI_TRANSCRIBER_RECORD_AUDIO=true
-      - JIGASI_TRANSCRIBER_SEND_TXT=true
-      - JIGASI_TRANSCRIBER_CUSTOM_SERVICE=org.jitsi.jigasi.transcription.WhisperTranscriptionService
-      - JIGASI_TRANSCRIBER_WHISPER_URL=ws://whisper:8000/asr/transcribe/streaming
-    networks:
-      - meet.jitsi
+  transcriber:
     depends_on:
-      - prosody
-      - whisper
-
-  whisper:
-    image: onerahmet/openai-whisper-asr-webservice:latest
+      vosk:
+        condition: service_healthy
+  vosk:
+    image: ${VOSK_IMAGE:?Set VOSK_IMAGE}
     restart: unless-stopped
-    environment:
-      - ASR_MODEL=base
-      - ASR_ENGINE=faster_whisper
-    volumes:
-      - whisper_models:/root/.cache/whisper
     networks:
       - meet.jitsi
-
-volumes:
-  whisper_models:
-networks:
-  meet.jitsi:
-    external: true
-EOFYML
-
-echo "[8/9] Pulling and launching stack..."
-cd "$JITSI_DIR"
-docker compose -f docker-compose.yml pull 2>&1 | tail -5
-docker compose -f transcriber.yml pull 2>&1 | tail -5
-docker compose -f docker-compose.yml -f transcriber.yml up -d
-
-echo "[9/9] Checking containers..."
-sleep 10
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-
-sudo ufw allow 80/tcp 2>/dev/null || true
-sudo ufw allow 443/tcp 2>/dev/null || true
-sudo ufw allow 8080/tcp 2>/dev/null || true
-sudo ufw allow 10000/udp 2>/dev/null || true
-sudo ufw allow 4443/tcp 2>/dev/null || true
-
-echo "=============================================="
-echo " Access Jitsi Meet: http://$LOCAL_IP:8080"
-echo "=============================================="
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1',2700),5).close()"]
+      interval: 10s
+      timeout: 6s
+      retries: 60
+      start_period: 180s
+YAML
+    chmod 600 "$INSTALL_DIR/.env"
+    compose config --quiet
+    printf 'Конфигурация готова: %s\nЗапуск: bash %q up --dir %q\n' "$INSTALL_DIR" "$0" "$INSTALL_DIR"
+    printf 'Перед публикацией настройте аутентификацию Jitsi (см. README). По умолчанию комнаты открытые.\n'
+else
+    [[ -f "$INSTALL_DIR/.meeting-pro-managed" && -f "$INSTALL_DIR/.env" ]] || die 'Сначала выполните configure.'
+    case "$ACTION" in
+        up) docker info >/dev/null; compose config --quiet; compose pull; compose up -d --wait --wait-timeout 900; compose ps ;;
+        status) compose ps ;;
+        logs) compose logs --tail=150 transcriber vosk ;;
+        stop) compose stop ;;
+    esac
+fi

@@ -1,0 +1,16 @@
+name: Installer checks
+on: [push, pull_request]
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n jitsi_install.sh test-installer.sh
+      - run: shellcheck jitsi_install.sh test-installer.sh
+      - run: git clone --depth 1 --branch stable-11248-3 https://github.com/jitsi/docker-jitsi-meet.git "$RUNNER_TEMP/upstream"
+      - run: UPSTREAM_FIXTURE="$RUNNER_TEMP/upstream" bash test-installer.sh
+      - name: Validate real Compose configuration
+        run: |
+          for dir in .installer-test.*/install; do
+            docker compose --env-file "$dir/.env" -f "$dir/docker-compose.yml" -f "$dir/transcriber.yml" -f "$dir/meeting-pro.yml" config --quiet
+          done
